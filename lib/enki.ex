@@ -7,12 +7,22 @@ defmodule Enki do
   ack'd within a given period of time, the message is automatically added
   back to the queue. This ensures that no messages are lost.
 
+  Queues must be created by calling Enki.init and passing a list of model
+  module names. Each model must be created as
+
+      defmodule MyApp.MyModel do
+        use Enki.Message,
+          attributes: [:attr1, :attr2, :attr3]
+      end
+
+  This replaces the need to use `defstruct`, as it ensures the correct
+  Enki meta is used.
+
   ## Examples
 
-      Enki.enq(%{a: 1, b: 2})
-      
-      %{id: id, payload: %{a: 1, b: 2}} = Enki.deq()
-
+      Enki.init([MyModel])
+      Enki.enq(%MyModel{a: 1, b: 2})
+      %MyModel{enki_id: id, a: 1, b: 2}} = Enki.deq(MyModel)
       :ok = Enki.ack(id)
   """
 
@@ -44,15 +54,6 @@ defmodule Enki do
   def start(_type, _args) do
     import Supervisor.Spec, warn: false
 
-    if file_persist() do
-      Memento.stop()
-      Memento.Schema.create(nodes())
-      Memento.start()
-      maybe_create_table(disc_copies: nodes())
-    else
-      maybe_create_table()
-    end
-
     children = [
       worker(Counter, [[]]),
       {DynamicSupervisor, strategy: :one_for_one, name: @sup}
@@ -66,23 +67,58 @@ defmodule Enki do
   end
 
   @doc """
+  Initialises the Queues.
+
+  ## Example:
+
+      Enki.init([MyModel, MyOtherModel])
+
+  ## Parameters
+
+  | name | description |
+  | ---- | ----------- |
+  | `types` | A list of model instances to use as queue types (required). |
+  """
+  @spec init(list(atom())) :: :ok | no_return
+  def init(types) do
+    if file_persist() do
+      Memento.stop()
+      Memento.Schema.create(nodes())
+      Memento.start()
+      maybe_create_tables(types, disc_copies: nodes())
+    else
+      maybe_create_tables(types)
+    end
+
+    :ok
+  end
+
+  @doc """
   Adds a message to the queue.
 
-  Returns a Message instance containing the `id` of the message
+  Returns a Message instance containing the `enki_id` of the message
   on the queue and the message itself as a `payload`.
+
+  ## Parameters
+
+  | name | description |
+  | ---- | ----------- |
+  | `message` | The model instance to queue (required). |
   """
-  @spec enq(any()) :: Message.t()
+  @spec enq(Message.t()) :: Message.t()
   def enq(message) do
     Memento.transaction!(fn ->
       id = Counter.next_value()
-      Memento.Query.write(%Message{id: "#{id}_#{UUID.uuid4(:hex)}", payload: message})
+
+      Map.put(message, :enki_id, "#{id}_#{UUID.uuid4(:hex)}")
+      |> Memento.Query.write()
     end)
   end
 
   @doc """
   Dequeues a message from the queue.
 
-  Returns the message in a `Message` struct as its
+  Returns the message in a `Message` model as its
   `payload` parameter. The message is typically the oldest in
   the queue.
 
@@ -90,10 +126,11 @@ defmodule Enki do
 
   | name | description |
   | ---- | ----------- |
+  | `queue` | The module type (atom) of the message to dequeue (required). |
   | `ttf` | The time-to-flight for the message. If provided, verrides the message in the config (optional). |
   """
-  def deq(ttf \\ nil) do
-    with %Enki.Message{id: id} = message <- deq_(),
+  def deq(queue, ttf \\ nil) do
+    with %{enki_id: id} = message <- deq_(queue),
          {:ok, _pid} <-
            DynamicSupervisor.start_child(
              @sup,
@@ -133,11 +170,12 @@ defmodule Enki do
 
   | name | description |
   | ---- | ----------- |
+  | `queue` | The module type (atom) of the message to retrieve (required). |
   | `id` | The `id` of the message to retrieve (required). |
   """
-  def get(id) do
+  def get(queue, id) do
     Memento.transaction!(fn ->
-      Memento.Query.read(Message, id)
+      Memento.Query.read(queue, id)
     end)
   end
 
@@ -150,14 +188,15 @@ defmodule Enki do
 
   | name | description |
   | ---- | ----------- |
+  | `queue` | The module type (atom) of the message to delete (required). |
   | `id` | The `id` of the message to delete (required). |
   """
-  def delete(id) do
+  def delete(queue, id) do
     Memento.transaction!(fn ->
-      case get(id) do
-        %Message{id: id} ->
+      case get(queue, id) do
+        %{enki_id: id} ->
           child_exit(id)
-          Memento.Query.delete(Message, id)
+          Memento.Query.delete(queue, id)
 
         _ ->
           :ok
@@ -170,12 +209,18 @@ defmodule Enki do
 
   Any in-flight messages are cancelled, so messages are not 
   added back to the queue.
+
+  ## Parameters
+
+  | name | description |
+  | ---- | ----------- |
+  | `queue` | The module type (atom) of the messages to delete (required). |
   """
-  def delete_all() do
+  def delete_all(queue) do
     Memento.transaction!(fn ->
-      Memento.Query.all(Message)
+      Memento.Query.all(queue)
       |> Enum.each(fn rec ->
-        child_exit(rec.id)
+        child_exit(rec.enki_id)
         Memento.Query.delete_record(rec)
       end)
     end)
@@ -195,17 +240,19 @@ defmodule Enki do
       |> Process.whereis()
       |> monitor_()
 
-  defp maybe_create_table(opts \\ []) do
-    try do
-      Memento.Table.info(Message)
-    catch
-      :exit, _ -> Memento.Table.create!(Message, opts)
-    end
+  defp maybe_create_tables(types, opts \\ []) do
+    Enum.each(types, fn t ->
+      try do
+        Memento.Table.info(t)
+      catch
+        :exit, _ -> Memento.Table.create!(t, opts)
+      end
+    end)
   end
 
-  defp deq_() do
+  defp deq_(queue) do
     Memento.transaction!(fn ->
-      with [%Message{} = msg] <- Memento.Query.select(Message, [], limit: 1),
+      with [%{} = msg] <- Memento.Query.select(queue, [], limit: 1),
            _ <- Memento.Query.delete_record(msg) do
         msg
       else

@@ -1,56 +1,78 @@
 defmodule EnkiTest do
   use ExUnit.Case, async: false
-  alias Enki.Message
   doctest Enki
 
   defmodule Quibble do
-    defstruct a: nil, b: nil
+    use Enki.Message,
+      attributes: [:a, :b]
+  end
+
+  defmodule Tribble do
+    use Enki.Message,
+      attributes: [:c, :d, :e]
   end
 
   @ttf 500
 
+  setup_all do
+    Enki.init([Quibble, Tribble])
+    :ok
+  end
+
   setup do
-    Enki.delete_all()
+    Enki.delete_all(Quibble)
+    Enki.delete_all(Tribble)
     :ok
   end
 
   test "add a message to the queue" do
     msg = %Quibble{a: 1, b: 2}
-    assert %Message{__meta__: Memento.Table, id: _, payload: ^msg} = Enki.enq(msg)
+    assert %Quibble{__meta__: Memento.Table, enki_id: _, a: 1, b: 2} = Enki.enq(msg)
   end
 
   test "dequeue a message when empty returns nil" do
-    assert nil == Enki.deq()
+    assert nil == Enki.deq(Quibble)
   end
 
   test "dequeuing a message deletes it from the queue" do
     msg = %Quibble{a: 3, b: 4}
-    %Message{} = Enki.enq(msg)
-    assert %Message{__meta__: Memento.Table, id: id, payload: ^msg} = Enki.deq(@ttf)
-    assert nil == Enki.get(id)
+    %Quibble{} = Enki.enq(msg)
+    assert %Quibble{__meta__: Memento.Table, enki_id: id, a: 3, b: 4} = Enki.deq(Quibble, @ttf)
+    assert nil == Enki.get(Quibble, id)
     assert Enki.child_exists?(id)
     Enki.monitor(id) |> wait_for_death()
   end
 
   test "dequeued message is requeued if not ack'd" do
     msg = %Quibble{a: 5, b: 6}
-    %Message{} = Enki.enq(msg)
-    assert %Message{__meta__: Memento.Table, id: id, payload: ^msg} = Enki.deq(@ttf)
+    %Quibble{} = Enki.enq(msg)
+    assert %Quibble{__meta__: Memento.Table, enki_id: id, a: 5, b: 6} = Enki.deq(Quibble, @ttf)
     assert Enki.child_exists?(id)
     Enki.monitor(id) |> wait_for_death()
     refute Enki.child_exists?(id)
-    assert %Message{__meta__: Memento.Table, id: id, payload: ^msg} = Enki.get(id)
+    assert %Quibble{__meta__: Memento.Table, enki_id: id, a: 5, b: 6} = Enki.get(Quibble, id)
   end
 
   test "dequeued message remains absent if ack'd" do
-    msg = %Quibble{a: 5, b: 6}
-    %Message{} = Enki.enq(msg)
-    assert %Message{__meta__: Memento.Table, id: id, payload: ^msg} = Enki.deq(@ttf)
+    msg = %Quibble{a: 7, b: 8}
+    %Quibble{} = Enki.enq(msg)
+    assert %Quibble{__meta__: Memento.Table, enki_id: id, a: 7, b: 8} = Enki.deq(Quibble, @ttf)
     assert Enki.child_exists?(id)
     assert :ok == Enki.ack(id)
     Enki.monitor(id) |> wait_for_death()
     refute Enki.child_exists?(id)
-    assert nil == Enki.get(id)
+    assert nil == Enki.get(Quibble, id)
+  end
+
+  test "create and retrive messages from multiple queues" do
+    msg = %Quibble{a: 9, b: 10}
+    %Quibble{} = Enki.enq(msg)
+    msg = %Tribble{c: 1, d: 2, e: 3}
+    %Tribble{} = Enki.enq(msg)
+    assert %Quibble{__meta__: Memento.Table, enki_id: _, a: 9, b: 10} = Enki.deq(Quibble, @ttf)
+
+    assert %Tribble{__meta__: Memento.Table, enki_id: _, c: 1, d: 2, e: 3} =
+             Enki.deq(Tribble, @ttf)
   end
 
   defp wait_for_death({ref, pid}) do
